@@ -3,6 +3,7 @@ package com.go300.gotodo
 import android.Manifest
 import android.app.AlertDialog
 import android.app.DatePickerDialog
+import android.app.KeyguardManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -57,20 +58,20 @@ data class TodoItem(
     val id: Long,
     val title: String,
     val isStarred: Boolean,
-    val dueDate: String, // "" 또는 "yyyy-MM-dd"
+    val dueDate: String,
     val isDone: Boolean,
     val createdAt: Long
 )
 
-// 2. 캘린더 일정 데이터 구조
+// 2. 캘린더 일정 데이터 구조 (향후 7일 표시용)
 data class CalendarEventItem(
     val title: String,
-    val timeText: String,
+    val scheduleLabel: String, // 예: "오늘 14:00~15:00", "11/15(일) 10:00 (D-3)"
     val startMillis: Long,
-    val isAllDay: Boolean
+    val isToday: Boolean
 )
 
-// 3. 할 일 저장소 및 캘린더 연동 매니저
+// 3. 할 일 저장소 및 1주일 내 일정(공휴일·절기 제외) 연동 매니저
 object TodoRepository {
     private const val PREF_NAME = "gotodo_prefs"
     private const val KEY_TODOS = "todos_json"
@@ -80,12 +81,20 @@ object TodoRepository {
     private const val KEY_SHOW_COMPLETED = "show_completed"
     private const val KEY_HIDE_WHEN_EMPTY = "hide_when_empty"
 
+    // 24절기 및 기본 공휴일/기념일 자동 필터링 키워드
+    private val SOLAR_TERMS_AND_HOLIDAYS = setOf(
+        "입춘", "우수", "경칩", "춘분", "청명", "곡우",
+        "입하", "소만", "망종", "하지", "소서", "대서",
+        "입추", "처서", "백로", "추분", "한로", "상강",
+        "입동", "소설", "대설", "동지", "소한", "대한",
+        "신정", "설날", "설날 연휴", "삼일절", "어린이날", "부처님오신날", "석가탄신일",
+        "현충일", "제헌절", "광복절", "추석", "추석 연휴", "개천절", "한글날",
+        "기독탄신일", "성탄절", "크리스마스", "대체공휴일", "대체휴일", "임시공휴일",
+        "초복", "중복", "말복", "정월대보름", "단오", "칠석", "한식", "동지"
+    )
+
     private fun prefs(context: Context) =
         context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-
-    var isServiceEnabled: Boolean
-        get() = true
-        set(_) {}
 
     fun getServiceEnabled(context: Context): Boolean =
         prefs(context).getBoolean(KEY_SERVICE_ENABLED, true)
@@ -93,8 +102,9 @@ object TodoRepository {
     fun setServiceEnabled(context: Context, value: Boolean) =
         prefs(context).edit().putBoolean(KEY_SERVICE_ENABLED, value).apply()
 
+    // false = 3단계(기본 잠금화면 알림 목록 표시), true = 4단계(전체 다크 보드 바로 팝업)
     fun getPopupOnScreenOn(context: Context): Boolean =
-        prefs(context).getBoolean(KEY_POPUP_ON_SCREEN_ON, true)
+        prefs(context).getBoolean(KEY_POPUP_ON_SCREEN_ON, false)
 
     fun setPopupOnScreenOn(context: Context, value: Boolean) =
         prefs(context).edit().putBoolean(KEY_POPUP_ON_SCREEN_ON, value).apply()
@@ -117,7 +127,6 @@ object TodoRepository {
     fun setHideWhenEmpty(context: Context, value: Boolean) =
         prefs(context).edit().putBoolean(KEY_HIDE_WHEN_EMPTY, value).apply()
 
-    // 저장된 전체 할 일 불러오기 및 우선순위 자동 정렬
     fun loadTodos(context: Context): List<TodoItem> {
         val raw = prefs(context).getString(KEY_TODOS, "[]") ?: "[]"
         val list = mutableListOf<TodoItem>()
@@ -138,7 +147,6 @@ object TodoRepository {
             }
         } catch (_: Exception) {}
 
-        // 정렬: 1. 미완료 우선 -> 2. 중요(⭐) 우선 -> 3. 기한 임박 순 -> 4. 등록 순
         return list.sortedWith(
             compareBy<TodoItem> { it.isDone }
                 .thenByDescending { it.isStarred }
@@ -211,7 +219,6 @@ object TodoRepository {
         saveTodos(context, updated)
     }
 
-    // 기한(D-Day) 꼬리표 계산
     fun getDueBadgeText(dueDate: String): Pair<String, String> {
         if (dueDate.isBlank()) return Pair("", "#90A4AE")
         return try {
@@ -223,7 +230,7 @@ object TodoRepository {
                 set(Calendar.MILLISECOND, 0)
             }
             val dueTime = sdf.parse(dueDate)?.time ?: return Pair(dueDate, "#90A4AE")
-            val diffDays = ((dueTime - todayCal.timeInMillis) / (24 * 60 * 60 * 1000L)).toInt()
+            val diffDays = ((dueTime - todayCal.timeInMillis) / 86_400_000L).toInt()
 
             when {
                 diffDays < 0 -> Pair("⚠️ 기한 지남 (${abs(diffDays)}일 경과 · $dueDate)", "#FF5252")
@@ -236,8 +243,45 @@ object TodoRepository {
         }
     }
 
-    // 휴대폰 기본 캘린더에서 '오늘의 일정(반복/종일 포함)' 읽어오기
-    fun loadTodayCalendarEvents(context: Context): List<CalendarEventItem> {
+    // 공휴일/절기 달력인지 판별하는 3단계 필터
+    private fun isHolidayOrSolarTermEvent(
+        title: String,
+        allDay: Boolean,
+        accessLevel: Int,
+        calName: String,
+        ownerAccount: String
+    ): Boolean {
+        // 1단계: 쓰기 권한이 없는 읽기 전용 구독 달력(공휴일·절기 달력) 제외
+        if (accessLevel < CalendarContract.Calendars.CAL_ACCESS_CONTRIBUTOR) {
+            return true
+        }
+
+        // 2단계: 달력 계정 주소나 달력 이름에 휴일/절기/음력이 포함된 경우 제외
+        val lowerOwner = ownerAccount.lowercase(Locale.ROOT)
+        val lowerCalName = calName.lowercase(Locale.ROOT)
+        if (lowerOwner.contains("holiday") ||
+            lowerOwner.contains("group.v.calendar.google.com") ||
+            lowerCalName.contains("휴일") ||
+            lowerCalName.contains("공휴일") ||
+            lowerCalName.contains("holiday") ||
+            lowerCalName.contains("절기") ||
+            lowerCalName.contains("음력") ||
+            lowerCalName.contains("기념일")
+        ) {
+            return true
+        }
+
+        // 3단계: 로컬 달력에 직접 박힌 24절기(입동, 소설 등) 및 법정공휴일 명칭 제외
+        val cleanTitle = title.trim().replace(Regex("\\s*\\(.*?\\)\\s*$"), "")
+        if (allDay && SOLAR_TERMS_AND_HOLIDAYS.contains(cleanTitle)) {
+            return true
+        }
+
+        return false
+    }
+
+    // 현재 시각 기준 '지나간 일정 제외 + 향후 7일(1주일) 이내의 내가 등록한 일정' 조회
+    fun loadUpcomingWeekUserEvents(context: Context): List<CalendarEventItem> {
         if (!getShowCalendar(context)) return emptyList()
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALENDAR)
             != PackageManager.PERMISSION_GRANTED
@@ -247,13 +291,16 @@ object TodoRepository {
 
         val results = mutableListOf<CalendarEventItem>()
         try {
+            val nowMs = System.currentTimeMillis()
+
             val todayStartCal = Calendar.getInstance().apply {
                 set(Calendar.HOUR_OF_DAY, 0)
                 set(Calendar.MINUTE, 0)
                 set(Calendar.SECOND, 0)
                 set(Calendar.MILLISECOND, 0)
             }
-            val todayEndCal = Calendar.getInstance().apply {
+            val weekEndCal = (todayStartCal.clone() as Calendar).apply {
+                add(Calendar.DAY_OF_YEAR, 7)
                 set(Calendar.HOUR_OF_DAY, 23)
                 set(Calendar.MINUTE, 59)
                 set(Calendar.SECOND, 59)
@@ -261,22 +308,27 @@ object TodoRepository {
             }
 
             val todayStartMs = todayStartCal.timeInMillis
-            val todayEndMs = todayEndCal.timeInMillis
-            val todayDateStr = SimpleDateFormat("yyyy-MM-dd", Locale.KOREA).format(todayStartCal.time)
-            val utcSdf = SimpleDateFormat("yyyy-MM-dd", Locale.KOREA).apply {
+            val weekEndMs = weekEndCal.timeInMillis
+
+            val localDateSdf = SimpleDateFormat("yyyy-MM-dd", Locale.KOREA)
+            val utcDateSdf = SimpleDateFormat("yyyy-MM-dd", Locale.KOREA).apply {
                 timeZone = TimeZone.getTimeZone("UTC")
             }
+            val shortDateSdf = SimpleDateFormat("M/d(E)", Locale.KOREA)
             val timeFormat = SimpleDateFormat("HH:mm", Locale.KOREA)
 
-            // 종일 일정(UTC 기준) 누락 방지를 위해 전후 하루 여유를 두고 Instances 조회
+            // 종일 일정(UTC 자정 기준) 오차 방지를 위해 전후 1일 여유를 두고 조회
             val queryStart = todayStartMs - 86_400_000L
-            val queryEnd = todayEndMs + 86_400_000L
+            val queryEnd = weekEndMs + 86_400_000L
 
             val projection = arrayOf(
                 CalendarContract.Instances.TITLE,
                 CalendarContract.Instances.BEGIN,
                 CalendarContract.Instances.END,
-                CalendarContract.Instances.ALL_DAY
+                CalendarContract.Instances.ALL_DAY,
+                CalendarContract.Calendars.CALENDAR_ACCESS_LEVEL,
+                CalendarContract.Calendars.CALENDAR_DISPLAY_NAME,
+                CalendarContract.Calendars.OWNER_ACCOUNT
             )
 
             val cursor = CalendarContract.Instances.query(
@@ -288,52 +340,92 @@ object TodoRepository {
 
             cursor?.use { c ->
                 while (c.moveToNext()) {
-                    val title = c.getString(0)?.ifBlank { "(제목 없음)" } ?: "(제목 없음)"
+                    val title = c.getString(0)?.trim() ?: ""
+                    if (title.isEmpty()) continue
+
                     val begin = c.getLong(1)
                     val end = c.getLong(2)
                     val allDay = c.getInt(3) == 1
+                    val accessLevel = c.getInt(4)
+                    val calName = c.getString(5) ?: ""
+                    val ownerAccount = c.getString(6) ?: ""
+
+                    // 공휴일·24절기 필터링
+                    if (isHolidayOrSolarTermEvent(title, allDay, accessLevel, calName, ownerAccount)) {
+                        continue
+                    }
 
                     if (allDay) {
-                        val beginUtcDate = utcSdf.format(Date(begin))
-                        if (beginUtcDate == todayDateStr) {
-                            results.add(
-                                CalendarEventItem(
-                                    title = title,
-                                    timeText = "종일",
-                                    startMillis = begin,
-                                    isAllDay = true
-                                )
-                            )
+                        // 종일 일정은 UTC 날짜 문자열을 로컬 자정 시간으로 변환하여 날짜 비교
+                        val eventDateStr = utcDateSdf.format(Date(begin))
+                        val eventLocalStartMs = localDateSdf.parse(eventDateStr)?.time ?: continue
+                        val diffDays = ((eventLocalStartMs - todayStartMs) / 86_400_000L).toInt()
+
+                        // 어제 이전(지나간 날짜)이거나 7일 초과 일정은 제외
+                        if (diffDays < 0 || diffDays > 7) continue
+
+                        val dayLabel = when (diffDays) {
+                            0 -> "오늘 종일"
+                            1 -> "내일 종일"
+                            else -> "${shortDateSdf.format(Date(eventLocalStartMs))} 종일 (D-$diffDays)"
                         }
+
+                        results.add(
+                            CalendarEventItem(
+                                title = title,
+                                scheduleLabel = dayLabel,
+                                startMillis = eventLocalStartMs,
+                                isToday = (diffDays == 0)
+                            )
+                        )
                     } else {
-                        if (begin <= todayEndMs && end >= todayStartMs) {
-                            val startStr = timeFormat.format(Date(begin))
-                            val endStr = timeFormat.format(Date(end))
-                            results.add(
-                                CalendarEventItem(
-                                    title = title,
-                                    timeText = "$startStr~$endStr",
-                                    startMillis = begin,
-                                    isAllDay = false
-                                )
-                            )
+                        // 시간 지정 일정: 종료 시각이 현재 시각(nowMs)보다 과거이면 이미 지나간 일정이므로 제외!
+                        if (end < nowMs || begin > weekEndMs) continue
+
+                        val eventDayCal = Calendar.getInstance().apply {
+                            timeInMillis = begin
+                            set(Calendar.HOUR_OF_DAY, 0)
+                            set(Calendar.MINUTE, 0)
+                            set(Calendar.SECOND, 0)
+                            set(Calendar.MILLISECOND, 0)
                         }
+                        val diffDays = ((eventDayCal.timeInMillis - todayStartMs) / 86_400_000L).toInt()
+                        if (diffDays > 7) continue
+
+                        val startStr = timeFormat.format(Date(begin))
+                        val endStr = timeFormat.format(Date(end))
+
+                        val dayPrefix = when {
+                            diffDays <= 0 -> "오늘 $startStr~$endStr"
+                            diffDays == 1 -> "내일 $startStr~$endStr"
+                            else -> "${shortDateSdf.format(Date(begin))} $startStr (D-$diffDays)"
+                        }
+
+                        results.add(
+                            CalendarEventItem(
+                                title = title,
+                                scheduleLabel = dayPrefix,
+                                startMillis = begin,
+                                isToday = (diffDays <= 0)
+                            )
+                        )
                     }
                 }
             }
         } catch (_: Exception) {}
 
         return results
-            .distinctBy { "${it.title}_${it.timeText}" }
-            .sortedWith(compareByDescending<CalendarEventItem> { it.isAllDay }.thenBy { it.startMillis })
+            .distinctBy { "${it.title}_${it.scheduleLabel}" }
+            .sortedBy { it.startMillis }
     }
 }
 
-// 4. 화면 2(잠금화면) 알림 카드 유지 및 화면 켜짐(노크온/전원버튼) 감지 서비스
+// 4. 잠금화면(화면 2) 알림 목록 유지 및 화면 켜짐 감지 서비스
 class TodoLockService : Service() {
 
     companion object {
-        const val CHANNEL_ID = "gotodo_lockscreen_channel"
+        // LG V510N 잠금화면에서 작은 아이콘으로 축소되지 않고 목록이 펼쳐지도록 기본 중요도(무음) 채널 사용
+        const val CHANNEL_ID = "gotodo_lockscreen_board_v2"
         const val NOTIF_ID = 2001
         const val ACTION_REFRESH = "com.go300.gotodo.ACTION_REFRESH"
 
@@ -367,12 +459,12 @@ class TodoLockService : Service() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (context == null) return
             if (intent?.action == Intent.ACTION_SCREEN_ON) {
-                // 화면이 켜질 때 알림창 날짜/일정도 함께 최신화
+                // 화면이 켜질 때마다 지나간 일정은 빼고 최신 목록으로 알림창 갱신
                 updateNotification()
 
+                // 3단계 모드(전체 다크 보드 팝업 OFF)일 때는 기본 잠금화면의 알림 목록만 보여주고 끝냄
                 if (!TodoRepository.getPopupOnScreenOn(context)) return
 
-                // 통화 중이거나 벨이 울릴 때는 보드를 띄우지 않음
                 val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
                 if (am != null && (am.mode == AudioManager.MODE_RINGTONE ||
                             am.mode == AudioManager.MODE_IN_CALL ||
@@ -382,15 +474,15 @@ class TodoLockService : Service() {
                 }
 
                 val pendingTodos = TodoRepository.loadTodos(context).filter { !it.isDone }
-                val todayEvents = TodoRepository.loadTodayCalendarEvents(context)
+                val upcomingEvents = TodoRepository.loadUpcomingWeekUserEvents(context)
                 if (TodoRepository.getHideWhenEmpty(context) &&
                     pendingTodos.isEmpty() &&
-                    todayEvents.isEmpty()
+                    upcomingEvents.isEmpty()
                 ) {
                     return
                 }
 
-                // 잠금화면 위로 OLED 다크 보드 즉시 실행
+                // 4단계 모드(전체 다크 보드 팝업 ON)일 때만 다크 보드 실행
                 try {
                     val boardIntent = Intent(context, LockBoardActivity::class.java).apply {
                         addFlags(
@@ -428,11 +520,13 @@ class TodoLockService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "고할일 잠금화면 할 일 보드",
-                NotificationManager.IMPORTANCE_LOW
+                "고할일 잠금화면 목록 표시 (무음)",
+                NotificationManager.IMPORTANCE_DEFAULT
             ).apply {
-                description = "잠금화면(화면 2)에 미완료 할 일과 오늘 일정을 표시합니다."
+                description = "잠금화면(화면 2)에 할 일과 1주일 내 일정을 소리 없이 펼쳐서 표시합니다."
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                setSound(null, null)
+                enableVibration(false)
                 setShowBadge(false)
             }
             val nm = getSystemService(NotificationManager::class.java)
@@ -442,9 +536,8 @@ class TodoLockService : Service() {
 
     private fun buildLockScreenNotification(): Notification {
         val pendingTodos = TodoRepository.loadTodos(this).filter { !it.isDone }
-        val todayEvents = TodoRepository.loadTodayCalendarEvents(this)
+        val upcomingEvents = TodoRepository.loadUpcomingWeekUserEvents(this)
 
-        // 알림 카드를 터치하면 잠금 해제 없이 전체 다크 보드가 열림
         val boardIntent = Intent(this, LockBoardActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
@@ -462,8 +555,8 @@ class TodoLockService : Service() {
         )
 
         val title = when {
-            pendingTodos.isEmpty() && todayEvents.isEmpty() -> "✅ 남은 할 일이 없습니다"
-            todayEvents.isNotEmpty() -> "📋 미완료 할 일 ${pendingTodos.size}건 · 📅 오늘 일정 ${todayEvents.size}건"
+            pendingTodos.isEmpty() && upcomingEvents.isEmpty() -> "✅ 남은 할 일 및 주간 일정이 없습니다"
+            upcomingEvents.isNotEmpty() -> "📋 할 일 ${pendingTodos.size}건 · 📅 7일 내 일정 ${upcomingEvents.size}건"
             else -> "📋 미완료 할 일 ${pendingTodos.size}건"
         }
 
@@ -473,23 +566,28 @@ class TodoLockService : Service() {
                 val star = if (first.isStarred) "⭐ " else "☐ "
                 "$star${first.title}" + if (pendingTodos.size > 1) " 외 ${pendingTodos.size - 1}건" else ""
             }
-            todayEvents.isNotEmpty() -> "📅 [${todayEvents.first().timeText}] ${todayEvents.first().title}"
+            upcomingEvents.isNotEmpty() -> {
+                val firstEv = upcomingEvents.first()
+                "📅 [${firstEv.scheduleLabel}] ${firstEv.title}"
+            }
             else -> "새로운 할 일을 등록하려면 터치하세요."
         }
 
         val inboxStyle = NotificationCompat.InboxStyle().setBigContentTitle(title)
-        for (ev in todayEvents.take(2)) {
-            inboxStyle.addLine("📅 [${ev.timeText}] ${ev.title}")
-        }
-        for (todo in pendingTodos.take(5)) {
+        for (todo in pendingTodos.take(4)) {
             val prefix = if (todo.isStarred) "⭐ " else "☐ "
             val dueTag = if (todo.dueDate.isNotEmpty()) " (${todo.dueDate})" else ""
             inboxStyle.addLine("$prefix${todo.title}$dueTag")
         }
-        if (pendingTodos.size > 5) {
-            inboxStyle.setSummaryText("+ 외 ${pendingTodos.size - 5}건 더보기 (터치하여 전체 보드 열기)")
+        for (ev in upcomingEvents.take(3)) {
+            inboxStyle.addLine("📅 [${ev.scheduleLabel}] ${ev.title}")
+        }
+
+        val extraCount = (pendingTodos.size - 4).coerceAtLeast(0) + (upcomingEvents.size - 3).coerceAtLeast(0)
+        if (extraCount > 0) {
+            inboxStyle.setSummaryText("+ 외 ${extraCount}건 더보기 (터치하여 전체 보드 열기)")
         } else {
-            inboxStyle.setSummaryText("고할일 · 터치하면 잠금화면 보드가 열립니다")
+            inboxStyle.setSummaryText("고할일 · 터치하면 큰 화면 보드가 열립니다")
         }
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
@@ -498,6 +596,8 @@ class TodoLockService : Service() {
             .setContentText(summaryLine)
             .setStyle(inboxStyle)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setSilent(true)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setContentIntent(boardPending)
@@ -527,7 +627,7 @@ class BootReceiver : BroadcastReceiver() {
     }
 }
 
-// 6. 화면 2 전용: 잠금화면 위에 뜨는 OLED 다크 보드 액티비티
+// 6. 전체 다크 보드 액티비티 (4단계 모드 또는 알림 터치 시 표시)
 class LockBoardActivity : AppCompatActivity() {
 
     private lateinit var clockText: TextView
@@ -547,7 +647,6 @@ class LockBoardActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 잠금 해제 없이 화면 2(잠금화면) 위에 즉시 표시되도록 설정
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
         }
@@ -586,11 +685,10 @@ class LockBoardActivity : AppCompatActivity() {
     private fun buildDarkBoardUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#080B11")) // OLED 순수 다크 배경
+            setBackgroundColor(Color.parseColor("#080B11"))
             setPadding(40, 48, 40, 36)
         }
 
-        // 상단 시계 및 날짜 영역
         clockText = TextView(this).apply {
             text = "00:00"
             textSize = 54f
@@ -607,7 +705,6 @@ class LockBoardActivity : AppCompatActivity() {
             setPadding(0, 4, 0, 28)
         }
 
-        // 중앙 스크롤 가능 영역 (할 일이 아무리 많아도 끝까지 스크롤 가능)
         val scrollView = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -665,29 +762,53 @@ class LockBoardActivity : AppCompatActivity() {
         scrollContent.addView(todoListContainer)
         scrollView.addView(scrollContent)
 
-        // 하단 닫기 버튼 영역
+        // 하단 버튼 2개: [잠금화면 닫기] / [바로 잠금해제(홈 화면 직행)]
         val bottomRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, 20, 0, 0)
         }
 
         val closeBtn = Button(this).apply {
-            text = "잠금화면으로 닫기"
-            textSize = 16f
+            text = "보드 닫기"
+            textSize = 15f
             setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.parseColor("#E2E8F0"))
+            setTextColor(Color.parseColor("#CBD5E1"))
             background = makeDarkCard("#1A2332", "#334155")
-            setPadding(24, 32, 24, 32)
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
+            setPadding(20, 30, 20, 30)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                rightMargin = 12
+            }
             setOnClickListener {
                 finish()
             }
         }
 
+        val unlockDirectBtn = Button(this).apply {
+            text = "🔓 바로 잠금해제"
+            textSize = 15f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            background = makeDarkCard("#0D3B4C", "#4DB6AC")
+            setPadding(20, 30, 20, 30)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                leftMargin = 12
+            }
+            setOnClickListener {
+                val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && km != null && km.isKeyguardLocked) {
+                    km.requestDismissKeyguard(this@LockBoardActivity, object : KeyguardManager.KeyguardDismissCallback() {
+                        override fun onDismissSucceeded() {
+                            finish()
+                        }
+                    })
+                } else {
+                    finish()
+                }
+            }
+        }
+
         bottomRow.addView(closeBtn)
+        bottomRow.addView(unlockDirectBtn)
 
         val footer = TextView(this).apply {
             text = "고할일  |  제작: 고삼백 (Go300)"
@@ -713,15 +834,15 @@ class LockBoardActivity : AppCompatActivity() {
     }
 
     private fun renderBoardContent() {
-        // 1) 오늘의 캘린더 일정 표시 (일정이 없으면 자동 숨김)
-        val events = TodoRepository.loadTodayCalendarEvents(this)
+        // 1) 향후 7일 이내의 내 캘린더 일정 표시 (공휴일·절기 및 지나간 일정 제외)
+        val events = TodoRepository.loadUpcomingWeekUserEvents(this)
         calendarContainer.removeAllViews()
         if (events.isEmpty()) {
             calendarContainer.visibility = View.GONE
         } else {
             calendarContainer.visibility = View.VISIBLE
             val calTitle = TextView(this).apply {
-                text = "📅 오늘의 캘린더 일정 (${events.size}건)"
+                text = "📅 다가오는 1주일 내 일정 (${events.size}건)"
                 textSize = 14.5f
                 setTypeface(null, Typeface.BOLD)
                 setTextColor(Color.parseColor("#64B5F6"))
@@ -730,10 +851,12 @@ class LockBoardActivity : AppCompatActivity() {
             calendarContainer.addView(calTitle)
 
             for (ev in events) {
+                val colorHex = if (ev.isToday) "#FFE082" else "#E3F2FD"
                 val evText = TextView(this).apply {
-                    text = "• [${ev.timeText}]  ${ev.title}"
+                    text = "• [${ev.scheduleLabel}]  ${ev.title}"
                     textSize = 14.5f
-                    setTextColor(Color.parseColor("#E3F2FD"))
+                    setTypeface(null, if (ev.isToday) Typeface.BOLD else Typeface.NORMAL)
+                    setTextColor(Color.parseColor(colorHex))
                     setPadding(4, 6, 4, 6)
                 }
                 calendarContainer.addView(evText)
@@ -814,7 +937,6 @@ class LockBoardActivity : AppCompatActivity() {
                 textCol.addView(dueView)
             }
 
-            // 실수 방지: 잠금화면 보드에서 완료 버튼을 누르면 확인 창이 한 번 뜸
             val actionBtn = Button(this).apply {
                 text = if (item.isDone) "↩ 복원" else "☐ 완료"
                 textSize = 13f
@@ -851,7 +973,7 @@ class LockBoardActivity : AppCompatActivity() {
     }
 }
 
-// 7. 화면 1 전용: 할 일 추가 및 잠금화면 보드 설정 메인 액티비티
+// 7. 화면 1: 할 일 추가 및 잠금화면 3단계/4단계 설정 메인 액티비티
 class MainActivity : AppCompatActivity() {
 
     private lateinit var todoInput: EditText
@@ -915,7 +1037,6 @@ class MainActivity : AppCompatActivity() {
             setPadding(36, 32, 36, 48)
         }
 
-        // [안내 배너] 잠금화면 자동 팝업을 위한 '다른 앱 위에 표시' 권한 안내
         overlayPermissionBanner = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = makeLightCard("#FFF8E1", "#FFB300")
@@ -928,21 +1049,21 @@ class MainActivity : AppCompatActivity() {
         }
 
         val bannerTitle = TextView(this).apply {
-            text = "💡 화면을 켤 때 할 일 보드가 바로 뜨게 하려면?"
+            text = "💡 4단계(전체 다크 보드 자동 팝업) 모드를 쓰시려면?"
             textSize = 14.5f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#E65100"))
         }
 
         val bannerDesc = TextView(this).apply {
-            text = "노크온이나 전원 버튼을 누르는 순간 잠금화면 위에 다크 보드를 바로 띄우려면 최초 1회 '다른 앱 위에 표시' 허용이 필요합니다."
+            text = "3단계(기본 잠금화면 알림 목록 표시)는 이 권한 없이도 바로 작동합니다. 화면을 켤 때 전체 다크 보드가 먼저 뜨는 4단계 모드를 원하실 때만 허용해주세요."
             textSize = 13f
             setTextColor(Color.parseColor("#5D4037"))
             setPadding(0, 8, 0, 16)
         }
 
         val grantOverlayBtn = Button(this).apply {
-            text = "권한 설정하러 가기 (1회)"
+            text = "다른 앱 위에 표시 권한 설정 (선택)"
             textSize = 13.5f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
@@ -962,7 +1083,7 @@ class MainActivity : AppCompatActivity() {
         overlayPermissionBanner.addView(bannerDesc)
         overlayPermissionBanner.addView(grantOverlayBtn)
 
-        // [카드 1] 새 할 일 빠른 등록 카드
+        // [카드 1] 새 할 일 등록
         val inputCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = makeLightCard("#FFFFFF")
@@ -1094,7 +1215,7 @@ class MainActivity : AppCompatActivity() {
         inputCard.addView(dueBtnRow)
         inputCard.addView(addBtn)
 
-        // [카드 2] 현재 할 일 및 오늘의 캘린더 일정 관리 카드
+        // [카드 2] 할 일 & 향후 1주일 내 일정 목록
         val listCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = makeLightCard("#FFFFFF")
@@ -1113,7 +1234,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val listHeaderTitle = TextView(this).apply {
-            text = "📋 등록된 할 일 & 오늘 일정"
+            text = "📋 할 일 & 향후 1주일 일정"
             textSize = 16.5f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#0D3B4C"))
@@ -1160,7 +1281,7 @@ class MainActivity : AppCompatActivity() {
         listCard.addView(todoListLayout)
         listCard.addView(clearCompletedBtn)
 
-        // [카드 3] 화면 2(잠금화면) 표시 방식 및 옵션 설정 카드
+        // [카드 3] 잠금화면 3단계 / 4단계 표시 설정
         val settingsCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = makeLightCard("#FFFFFF")
@@ -1173,7 +1294,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val settingsTitle = TextView(this).apply {
-            text = "⚙️ 잠금화면(화면 2) 표시 설정"
+            text = "⚙️ 잠금화면(화면 2) 표시 방식 설정"
             textSize = 16f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#0D3B4C"))
@@ -1181,7 +1302,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val previewBoardBtn = Button(this).apply {
-            text = "🔍 잠금화면 다크 보드 미리보기 (즉시 테스트)"
+            text = "🔍 전체 다크 보드 미리보기"
             textSize = 14.5f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
@@ -1198,7 +1319,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val serviceSwitch = Switch(this).apply {
-            text = "🔒 잠금화면 할 일 서비스 켜기"
+            text = "🔒 잠금화면 할 일 표시 기능 켜기 (기본 3단계)"
             textSize = 14.5f
             isChecked = TodoRepository.getServiceEnabled(this@MainActivity)
             setPadding(0, 14, 0, 14)
@@ -1210,18 +1331,19 @@ class MainActivity : AppCompatActivity() {
         }
 
         val popupSwitch = Switch(this).apply {
-            text = "📱 화면 켜질 때 전체 다크 보드 바로 띄우기"
-            textSize = 14.5f
+            text = "📱 4단계 모드: 화면 켤 때 전체 다크 보드 먼저 띄우기\n(끄면 3단계: 기본 잠금화면 알림 목록에만 표시)"
+            textSize = 13.5f
             isChecked = TodoRepository.getPopupOnScreenOn(this@MainActivity)
             setPadding(0, 14, 0, 14)
             setOnCheckedChangeListener { _, isChecked ->
                 TodoRepository.setPopupOnScreenOn(this@MainActivity, isChecked)
+                updateOverlayPermissionBanner()
             }
         }
 
         val calendarSwitch = Switch(this).apply {
-            text = "📅 휴대폰 기본 캘린더 '오늘 일정' 함께 표시"
-            textSize = 14.5f
+            text = "📅 향후 1주일 내 캘린더 일정 함께 표시 (공휴일·절기 제외)"
+            textSize = 13.5f
             isChecked = TodoRepository.getShowCalendar(this@MainActivity)
             setPadding(0, 14, 0, 14)
             setOnCheckedChangeListener { _, isChecked ->
@@ -1233,7 +1355,7 @@ class MainActivity : AppCompatActivity() {
 
         val showCompletedSwitch = Switch(this).apply {
             text = "✅ 완료된 할 일도 취소선 그어서 표시"
-            textSize = 14.5f
+            textSize = 14f
             isChecked = TodoRepository.getShowCompleted(this@MainActivity)
             setPadding(0, 14, 0, 14)
             setOnCheckedChangeListener { _, isChecked ->
@@ -1243,8 +1365,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         val hideEmptySwitch = Switch(this).apply {
-            text = "🙈 할 일·오늘 일정이 0건일 땐 보드 자동 숨김"
-            textSize = 14.5f
+            text = "🙈 할 일·주간 일정이 0건일 땐 자동 숨김"
+            textSize = 14f
             isChecked = TodoRepository.getHideWhenEmpty(this@MainActivity)
             setPadding(0, 14, 0, 14)
             setOnCheckedChangeListener { _, isChecked ->
@@ -1282,7 +1404,8 @@ class MainActivity : AppCompatActivity() {
         val canDraw = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             Settings.canDrawOverlays(this)
         } else true
-        overlayPermissionBanner.visibility = if (canDraw) View.GONE else View.VISIBLE
+        val want4Stage = TodoRepository.getPopupOnScreenOn(this)
+        overlayPermissionBanner.visibility = if (!canDraw && want4Stage) View.VISIBLE else View.GONE
     }
 
     private fun checkAndRequestPermissions() {
@@ -1309,9 +1432,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshMainLists() {
-        // 1) 오늘의 캘린더 일정 영역
+        // 1) 향후 1주일 내 캘린더 일정 영역 (지나간 일정 및 공휴일·절기 제외)
         calendarSectionLayout.removeAllViews()
-        val events = TodoRepository.loadTodayCalendarEvents(this)
+        val events = TodoRepository.loadUpcomingWeekUserEvents(this)
         if (events.isNotEmpty()) {
             val calBox = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
@@ -1324,8 +1447,8 @@ class MainActivity : AppCompatActivity() {
                 layoutParams = params
             }
             val title = TextView(this).apply {
-                text = "📅 오늘의 캘린더 일정 (${events.size}건)"
-                textSize = 14f
+                text = "📅 다가오는 1주일 내 일정 (${events.size}건 · 공휴일/절기 제외)"
+                textSize = 13.5f
                 setTypeface(null, Typeface.BOLD)
                 setTextColor(Color.parseColor("#1565C0"))
                 setPadding(0, 0, 0, 8)
@@ -1333,9 +1456,10 @@ class MainActivity : AppCompatActivity() {
             calBox.addView(title)
             for (ev in events) {
                 val line = TextView(this).apply {
-                    text = "• [${ev.timeText}] ${ev.title}"
+                    text = "• [${ev.scheduleLabel}]  ${ev.title}"
                     textSize = 13.5f
-                    setTextColor(Color.parseColor("#0D47A1"))
+                    setTypeface(null, if (ev.isToday) Typeface.BOLD else Typeface.NORMAL)
+                    setTextColor(Color.parseColor(if (ev.isToday) "#0D47A1" else "#1E293B"))
                     setPadding(4, 4, 4, 4)
                 }
                 calBox.addView(line)
