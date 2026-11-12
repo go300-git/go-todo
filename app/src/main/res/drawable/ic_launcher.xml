@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 짙은 딥틸(청록 네이비) 배경 ('고목녹' 아이콘과 구분되는 색상) -->
+    <path
+        android:fillColor="#0D3B4C"
+        android:pathData="M0,0h108v108h-108z" />
+
+    <!-- 안쪽 테두리 장식선 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#4DB6AC"
+        android:strokeWidth="2"
+        android:pathData="M10,10h88v88h-88z" />
+
+    <!-- '고' 글자 벡터 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="4.0"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M15,38 H32 V50 M23.5,52 V65 M12,65 H35" />
+
+    <!-- '할' 글자 벡터 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M45,33 H55 M41,38 H59 M44,43 H56 V51 H44 Z M62,33 V52 M62,43 H67 M43,56 H64 V62 H43 V69 H65" />
+
+    <!-- '일' 글자 벡터 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M73,36 H85 V49 H73 Z M92,33 V51 M73,56 H93 V62 H73 V69 H94" />
+</vector>
